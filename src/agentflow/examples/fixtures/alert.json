@@ -1,0 +1,10 @@
+{
+  "alert_id": "ALERT-1042",
+  "service": "checkout",
+  "title": "checkout p95 latency above SLO",
+  "metric": "http_server_duration_p95_ms",
+  "threshold_ms": 800,
+  "observed_ms": 2350,
+  "fired_at": "2026-10-28T14:07:00Z",
+  "reporter": {"name": "synthetic-monitor", "phone": "+1 555 0100"}
+}
