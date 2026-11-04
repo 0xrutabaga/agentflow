@@ -264,7 +264,14 @@ class _Driver:
             tool_calls=record.tool_call_count,
         )
         if record.status is RunStatus.PENDING:
-            self.transition(RunStatus.RUNNING, "started")
+            with self.store.tx(self.run_id, self.token) as tx:
+                # Re-checked inside the transaction: an operator may have cancelled the pending
+                # run between the read above and the claim.
+                started = tx.status() is RunStatus.PENDING
+                if started:
+                    tx.set_status(RunStatus.RUNNING, "started")
+            if started:
+                self.emit("state", **{"from": "pending", "to": "running", "reason": "started"})
         elif record.status is RunStatus.BLOCKED:
             if self._stop_if_needed():
                 return self.rt.outcome(self.run_id)
