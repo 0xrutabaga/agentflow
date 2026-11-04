@@ -12,6 +12,7 @@ import contextlib
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,29 @@ def _hard_kill(pid: int) -> None:
         os.kill(pid, sig)
 
 
+def _wait_gone(pid: int, timeout_s: float) -> None:
+    """Wait until ``pid`` has fully exited and released its file handles."""
+    if sys.platform == "win32":
+        import ctypes
+
+        synchronize = 0x00100000
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(synchronize, False, pid)
+        if handle:  # 0 means the process is already gone
+            try:
+                kernel32.WaitForSingleObject(handle, int(timeout_s * 1000))
+            finally:
+                kernel32.CloseHandle(handle)
+        return
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.02)
+
+
 def kill_when_marked(proc: subprocess.Popen[Any], marker: Path, timeout_s: float = 60.0) -> int:
     """Wait for ``marker`` to appear, then hard-kill the stalled interpreter.
 
@@ -68,4 +92,6 @@ def kill_when_marked(proc: subprocess.Popen[Any], marker: Path, timeout_s: float
     _hard_kill(stalled_pid)
     proc.kill()
     proc.wait(timeout=30)
+    if stalled_pid != proc.pid:
+        _wait_gone(stalled_pid, 30.0)
     return stalled_pid
