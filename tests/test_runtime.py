@@ -449,3 +449,18 @@ def test_tool_arguments_reach_the_tool(harness: Harness) -> None:
     tool = make_tool("t", lambda q: seen.append(q) or {"q": q}, parameters=params)
     harness.start(make_agent([call("t", q="abc"), FINAL], [tool]))
     assert seen == ["abc"]
+
+
+def test_run_cancelled_between_read_and_claim_does_not_start(harness: Harness) -> None:
+    agent = make_agent([FINAL])
+    run_id = harness.runtime.create("tests:inline", "goal", agent=agent)
+    store = harness.runtime.store
+    real_claim = store.claim
+
+    def claim_after_cancel(rid: str) -> str:
+        harness.runtime.cancel(rid)  # operator acts after run() read `pending`
+        return real_claim(rid)
+
+    store.claim = claim_after_cancel  # type: ignore[method-assign]
+    outcome = harness.runtime.run(run_id, agent=agent)
+    assert outcome.status is RunStatus.CANCELLED

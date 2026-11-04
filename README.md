@@ -124,7 +124,7 @@ Design decisions and their alternatives are in
   transactions, no server. Durability here is per-run step checkpoints, not a shared job queue.
 - **jsonschema** (Draft 2020-12) for tool arguments and model output.
 - **httpx** only for the optional HTTP provider, because it ships `MockTransport` for tests.
-- No agent framework. The run loop is one file, `src/agentflow/runtime.py` (`wc -l` reports 590
+- No agent framework. The run loop is one file, `src/agentflow/runtime.py` (`wc -l` reports 597
   lines), and every behaviour above is in it.
 
 ## Installation
@@ -205,22 +205,58 @@ uv run agentflow --data-dir DIR start --agent package.module:factory --goal "...
 progress. The factory named by `--agent` takes the data directory and returns an
 `agentflow.Agent`; its module must be importable (for example via `PYTHONPATH`).
 
-Defining an agent in code:
+Defining an agent in code (this block runs as is; `ScriptedModel` stands in for a real model):
 
 ```python
 from pathlib import Path
-from agentflow import Agent, Limits, Tool, ToolRegistry, RetryPolicy, Runtime
+from tempfile import mkdtemp
+
+from agentflow import Agent, Limits, ModelResponse, RetryPolicy, Runtime, Tool, ToolCallRequest
+from agentflow import ToolRegistry
+from agentflow.providers import ScriptedModel
+
 
 def build(data_dir: Path) -> Agent:
     lookup = Tool(
-        name="lookup", description="Read a record.", idempotent=True, timeout_s=5,
-        parameters={"type": "object", "properties": {"id": {"type": "string"}},
-                    "required": ["id"], "additionalProperties": False},
-        fn=lambda id: {"id": id}, retry=RetryPolicy(max_attempts=3),
+        name="lookup",
+        description="Read a record.",
+        parameters={
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+            "additionalProperties": False,
+        },
+        fn=lambda id: {"id": id, "owner": "team-a"},
+        idempotent=True,
+        timeout_s=5,
+        retry=RetryPolicy(max_attempts=3),
     )
-    return Agent(name="example", system_prompt="...", tools=ToolRegistry([lookup]),
-                 provider=..., output_schema={"type": "object"}, limits=Limits(max_steps=10))
+    model = ScriptedModel(
+        [
+            ModelResponse(tool_calls=(ToolCallRequest("c1", "lookup", {"id": "r-1"}),)),
+            ModelResponse(content='{"owner": "team-a"}'),
+        ]
+    )
+    return Agent(
+        name="example",
+        system_prompt="Find the owner of record r-1.",
+        tools=ToolRegistry([lookup]),
+        provider=model,
+        output_schema={"type": "object", "required": ["owner"]},
+        limits=Limits(max_steps=10),
+    )
+
+
+data_dir = Path(mkdtemp())
+runtime = Runtime(data_dir)
+agent = build(data_dir)
+run_id = runtime.create("my_module:build", "who owns r-1?", agent=agent)
+print(runtime.run(run_id, agent=agent))  # RunOutcome(..., status=<RunStatus.COMPLETED ...>, ...)
+runtime.close()
 ```
+
+Passing `agent=` skips the import; `agent_ref` (`"my_module:build"`) is what `agentflow resume`
+imports in a new process, so it must name an importable factory there.
 
 Using a real model (optional, never needed for tests or the demo):
 
@@ -240,7 +276,7 @@ uv run mypy src
 uv run pytest -q
 ```
 
-`uv run pytest -q` currently collects 79 tests. The ones that carry the main claims:
+`uv run pytest -q` currently collects 80 tests. The ones that carry the main claims:
 
 | Claim | Test |
 | --- | --- |
