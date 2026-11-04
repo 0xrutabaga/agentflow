@@ -1,0 +1,6 @@
+{"ts": "2026-10-28T13:58:12Z", "service": "checkout", "level": "info", "msg": "deploy 2026.10.28-2 started"}
+{"ts": "2026-10-28T14:01:40Z", "service": "checkout", "level": "warn", "msg": "db pool exhausted (size=10, waiting=37)"}
+{"ts": "2026-10-28T14:02:03Z", "service": "checkout", "level": "error", "msg": "timeout acquiring db connection after 2000ms", "session_token": "demo-session-value"}
+{"ts": "2026-10-28T14:03:51Z", "service": "checkout", "level": "error", "msg": "upstream timeout calling payments after 2000ms"}
+{"ts": "2026-10-28T14:04:10Z", "service": "payments", "level": "info", "msg": "healthy; p95 120ms"}
+{"ts": "2026-10-28T14:05:27Z", "service": "checkout", "level": "error", "msg": "timeout acquiring db connection after 2000ms"}
