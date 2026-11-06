@@ -41,7 +41,7 @@ _SEGMENT = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
 # Common credential shapes, redacted wherever they appear inside string values (goals, error
 # messages, tool results, malformed argument strings). Not exhaustive; see README.
 SECRET_VALUE = re.compile(
-    r"\bsk-[A-Za-z0-9_-]{8,}"  # OpenAI-style API keys
+    r"\bsk-[A-Za-z0-9_-]{6,}"  # OpenAI-style API keys
     r"|\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}"  # GitHub
     r"|\bAKIA[0-9A-Z]{16}\b"  # AWS access key id
     r"|\bxox[abprs]-[A-Za-z0-9-]{10,}"  # Slack

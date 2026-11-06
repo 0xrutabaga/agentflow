@@ -292,7 +292,7 @@ uv run mypy src
 uv run pytest -q
 ```
 
-`uv run pytest -q` currently collects 112 tests. The ones that carry the main claims:
+`uv run pytest -q` currently collects 113 tests. The ones that carry the main claims:
 
 | Claim | Test |
 | --- | --- |
