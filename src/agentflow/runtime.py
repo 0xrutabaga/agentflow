@@ -42,7 +42,7 @@ from agentflow.tools import (
     TransientToolError,
     invoke_with_timeout,
 )
-from agentflow.trace import TraceWriter
+from agentflow.trace import TraceWriter, redact_sensitive_keys
 
 Listener = Callable[[dict[str, Any]], None]
 
@@ -122,7 +122,12 @@ class Runtime:
         token = self.store.claim(run_id)
         return _Driver(self, agent, run_id, token).drive()
 
-    def cancel(self, run_id: str) -> RunStatus:
+    def _operator_trace(self, agent: Agent | None) -> TraceWriter:
+        # Operator events carry ids, tool names and statuses only, never arguments or results;
+        # the agent's redactor is still applied when the caller has the agent.
+        return TraceWriter(self.trace_dir, agent.redactor if agent else redact_sensitive_keys)
+
+    def cancel(self, run_id: str, agent: Agent | None = None) -> RunStatus:
         """Cancel now if no runner can be mid-step, otherwise flag it for the runner.
 
         A ``pending`` or ``blocked`` run is cancelled immediately. For ``running`` and
@@ -141,7 +146,7 @@ class Runtime:
                 status = RunStatus.CANCELLED
             else:
                 status = current
-        TraceWriter(self.trace_dir).write(run_id, "cancel_requested", status=status.value)
+        self._operator_trace(agent).write(run_id, "cancel_requested", status=status.value)
         return status
 
     def resolve(
@@ -150,6 +155,7 @@ class Runtime:
         call_id: str,
         action: Literal["retry", "fail", "succeed"],
         value: Any = None,
+        agent: Agent | None = None,
     ) -> None:
         """Operator decision for an ``ambiguous`` call on a ``blocked`` run.
 
@@ -180,7 +186,7 @@ class Runtime:
                 tx.add_message(_tool_message(call, {"ok": True, "result": value}))
             else:
                 raise ValueError(f"unknown action {action!r}")
-        TraceWriter(self.trace_dir).write(
+        self._operator_trace(agent).write(
             run_id, "operator_resolved", call_id=call_id, tool=call.tool, action=action
         )
 
@@ -246,7 +252,21 @@ class _Driver:
         if stop is None:
             return False
         status, reason = stop
-        self.transition(status, reason, error=reason)
+        in_flight = [
+            c for c in self.store.tool_calls(self.run_id) if c.status is ToolCallStatus.STARTED
+        ]
+        with self.store.tx(self.run_id, self.token) as tx:
+            # An attempt left `started` by a dead process may or may not have happened; say so
+            # instead of leaving it looking as if it were still running.
+            for c in in_flight:
+                tx.update_tool_call(
+                    c.call_id,
+                    ToolCallStatus.AMBIGUOUS,
+                    attempts=c.attempts,
+                    error=f"run {status.value} while this attempt was in flight; outcome unknown",
+                )
+            previous = self._apply_transition(tx, status, reason, None, reason)
+        self.emit("state", **{"from": previous.value, "to": status.value, "reason": reason})
         return True
 
     def _remaining_s(self) -> float | None:
@@ -272,9 +292,7 @@ class _Driver:
                     tx.set_status(RunStatus.RUNNING, "started")
             if started:
                 self.emit("state", **{"from": "pending", "to": "running", "reason": "started"})
-        elif record.status is RunStatus.BLOCKED:
-            if self._stop_if_needed():
-                return self.rt.outcome(self.run_id)
+        elif record.status is RunStatus.BLOCKED and not self._stop_if_needed():
             unresolved = [
                 c.call_id
                 for c in self.store.tool_calls(self.run_id)
@@ -395,7 +413,18 @@ class _Driver:
                         )
                     )
                 else:
-                    tx.add_tool_call(call_id, turn, idx, request, ToolCallStatus.REQUESTED)
+                    tool = self.agent.tools.get(request.name)
+                    if tool is None:  # pragma: no cover - check_call already rejected it
+                        raise AssertionError(request.name)
+                    tx.add_tool_call(
+                        call_id,
+                        turn,
+                        idx,
+                        request,
+                        ToolCallStatus.REQUESTED,
+                        idempotent=tool.idempotent,
+                        max_attempts=tool.retry.max_attempts,
+                    )
             if rejected:
                 repairs = tx.bump("repairs")
                 events.append(("repair", {"kind": "tool_arguments", "repairs": repairs}))
@@ -477,34 +506,54 @@ class _Driver:
                 return
         self.transition(RunStatus.RUNNING, "tool results recorded")
 
+    def _policy(self, call: ToolCallRecord, tool: Tool | None) -> tuple[bool, int]:
+        """Idempotency and attempt limit as recorded when the model requested the call.
+
+        The recorded policy wins over the current code, so changing a tool's declaration between
+        a crash and a resume cannot turn an unsafe retry into an automatic one. Calls recorded
+        before schema v2 fall back to the current tool, and to "not idempotent" if it is gone.
+        """
+        idempotent = call.idempotent
+        if idempotent is None:
+            idempotent = tool.idempotent if tool is not None else False
+        max_attempts = call.max_attempts
+        if max_attempts is None:
+            max_attempts = tool.retry.max_attempts if tool is not None else 1
+        return idempotent, max_attempts
+
     def _handle_call(self, call: ToolCallRecord) -> _Step:
         tool = self.agent.tools.get(call.tool)
-        if tool is None:
-            return self._finish_call(call, None, f"tool {call.tool!r} is no longer registered")
-        if call.status is ToolCallStatus.REQUESTED:
-            return self._execute(call, tool)
+        idempotent, max_attempts = self._policy(call, tool)
+        if call.status is ToolCallStatus.AMBIGUOUS:
+            return self._block(call, call.error or "unresolved ambiguous call")
         if call.status is ToolCallStatus.STARTED:
             # The previous process started this attempt and died before recording a result.
             self.emit(
                 "tool_interrupted", call_id=call.call_id, tool=call.tool, attempt=call.attempts
             )
-            if tool.idempotent:
-                if call.attempts < tool.retry.max_attempts:
-                    return self._execute(call, tool)
+            if not idempotent:
+                return self._block(call, "attempt was interrupted before its result was recorded")
+            if call.attempts >= max_attempts:
                 return self._finish_call(
                     call,
                     None,
                     f"attempts exhausted ({call.attempts}); the last attempt was interrupted",
                 )
-            return self._block(call, "attempt was interrupted before its result was recorded")
-        if call.status is ToolCallStatus.AMBIGUOUS:
-            return self._block(call, call.error or "unresolved ambiguous call")
+            if tool is None:
+                return self._finish_call(
+                    call, None, f"tool {call.tool!r} is no longer registered; not retried"
+                )
+            return self._execute(call, tool, idempotent, max_attempts)
+        if call.status is ToolCallStatus.REQUESTED:
+            if tool is None:  # never started, so failing it is a definite outcome
+                return self._finish_call(call, None, f"tool {call.tool!r} is no longer registered")
+            return self._execute(call, tool, idempotent, max_attempts)
         raise AssertionError(f"unexpected call status {call.status}")  # pragma: no cover
 
     def _block(self, call: ToolCallRecord, why: str) -> _Step:
         reason = (
-            f"tool call {call.call_id} ({call.tool}) is not idempotent and its outcome is unknown:"
-            f" {why}"
+            f"tool call {call.call_id} ({call.tool}) cannot be retried automatically and its"
+            f" outcome is unknown: {why}"
         )
         with self.store.tx(self.run_id, self.token) as tx:
             tx.update_tool_call(
@@ -524,7 +573,12 @@ class _Driver:
         self.emit("tool_failed", call_id=call.call_id, tool=call.tool, error=error)
         return _Step.DONE
 
-    def _execute(self, call: ToolCallRecord, tool: Tool) -> _Step:
+    def _execute(
+        self, call: ToolCallRecord, tool: Tool, idempotent: bool, max_attempts: int
+    ) -> _Step:
+        bind_errors = tool.binding_errors(call.arguments)
+        if bind_errors:  # the function would raise TypeError before doing anything
+            return self._finish_call(call, call.attempts or None, "; ".join(bind_errors))
         attempt = call.attempts
         while True:
             attempt += 1
@@ -534,9 +588,17 @@ class _Driver:
             if self._stop_if_needed():
                 return _Step.STOP
             remaining = self._remaining_s()
-            timeout = (
-                tool.timeout_s if remaining is None else max(0.0, min(tool.timeout_s, remaining))
-            )
+            if not idempotent and remaining is not None and remaining < tool.timeout_s:
+                # Starting it now could only end in a deadline-capped timeout, which is
+                # ambiguous for a non-idempotent tool while its side effect may still happen.
+                reason = (
+                    f"budget_exhausted: {max(0.0, remaining):.2f}s left before the deadline is"
+                    f" less than the {tool.timeout_s:g}s timeout of non-idempotent call"
+                    f" {call.call_id} ({call.tool}); call not started"
+                )
+                self.transition(RunStatus.FAILED, reason, error=reason)
+                return _Step.STOP
+            timeout = tool.timeout_s if remaining is None else min(tool.timeout_s, remaining)
             with self.store.tx(self.run_id, self.token) as tx:
                 tx.update_tool_call(
                     call.call_id, ToolCallStatus.STARTED, attempts=attempt, started=True
@@ -575,10 +637,10 @@ class _Driver:
                 )
                 return _Step.DONE
 
-            if kind == "ambiguous" and not tool.idempotent:
+            if kind == "ambiguous" and not idempotent:
                 return self._block(replace(call, attempts=attempt), error)
             retryable = kind == "transient" or kind == "ambiguous"
-            if retryable and attempt < tool.retry.max_attempts:
+            if retryable and attempt < max_attempts:
                 with self.store.tx(self.run_id, self.token) as tx:
                     tx.update_tool_call(
                         call.call_id, ToolCallStatus.REQUESTED, attempts=attempt, error=error

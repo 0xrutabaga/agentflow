@@ -24,7 +24,7 @@ from typing import Any
 from agentflow.messages import Message, ToolCallRequest
 from agentflow.state import RunStatus, ToolCallStatus, check_transition
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _RUN_STATUSES = ", ".join(f"'{s.value}'" for s in RunStatus)
 _CALL_STATUSES = ", ".join(f"'{s.value}'" for s in ToolCallStatus)
@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     error       TEXT,
     started_at  REAL,
     finished_at REAL,
+    idempotent   INTEGER,  -- tool policy recorded when the model requested the call
+    max_attempts INTEGER,
     PRIMARY KEY (run_id, call_id)
 );
 CREATE TABLE IF NOT EXISTS transitions (
@@ -132,6 +134,8 @@ class ToolCallRecord:
     error: str | None
     started_at: float | None
     finished_at: float | None
+    idempotent: bool | None  # None: rejected call, never had a policy
+    max_attempts: int | None
 
 
 def _loads(text: str | None) -> Any:
@@ -220,10 +224,14 @@ class Tx:
         request: ToolCallRequest,
         status: ToolCallStatus,
         error: str | None = None,
+        *,
+        idempotent: bool | None = None,
+        max_attempts: int | None = None,
     ) -> None:
         self.conn.execute(
             "INSERT INTO tool_calls (run_id, call_id, turn, idx, provider_id, tool, arguments,"
-            " status, error, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " status, error, finished_at, idempotent, max_attempts)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 self.run_id,
                 call_id,
@@ -235,6 +243,8 @@ class Tx:
                 status.value,
                 error,
                 self.now if status is ToolCallStatus.REJECTED else None,
+                None if idempotent is None else int(idempotent),
+                max_attempts,
             ),
         )
 
@@ -279,9 +289,12 @@ class Store:
         self.conn.execute("PRAGMA synchronous = FULL")
         self.conn.execute("PRAGMA foreign_keys = ON")
         (version,) = self.conn.execute("PRAGMA user_version").fetchone()
-        if version not in (0, SCHEMA_VERSION):
+        if version not in (0, 1, SCHEMA_VERSION):
             raise RuntimeError(f"unsupported store schema version {version}")
         self.conn.executescript(SCHEMA)
+        if version == 1:  # v2 records each call's idempotency and attempt policy
+            self.conn.execute("ALTER TABLE tool_calls ADD COLUMN idempotent INTEGER")
+            self.conn.execute("ALTER TABLE tool_calls ADD COLUMN max_attempts INTEGER")
         self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def close(self) -> None:
@@ -418,6 +431,8 @@ class Store:
             data["arguments"] = _loads(data["arguments"])
             data["status"] = ToolCallStatus(data["status"])
             data["result"] = _loads(data["result"])
+            if data["idempotent"] is not None:
+                data["idempotent"] = bool(data["idempotent"])
             records.append(ToolCallRecord(**data))
         return records
 
