@@ -337,3 +337,8 @@ def test_schema_v1_database_is_migrated_and_old_calls_use_current_policy(tmp_pat
     reopened = Runtime(tmp_path)  # a second open must not try to migrate again
     assert reopened.store.get_run(run_id).status is RunStatus.BLOCKED
     reopened.close()
+
+
+def test_short_sk_keys_are_redacted_but_words_containing_sk_are_not() -> None:
+    out = redact_sensitive_keys({"goal": "use key sk-LIVE999 for this task-manager"})
+    assert out["goal"] == f"use key {REDACTED} for this task-manager"
