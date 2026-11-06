@@ -46,6 +46,17 @@ whole run); fail the run on ambiguity (loses all progress for a question a human
 minute). `Runtime.resolve` gives the operator three answers: `retry`, `fail`, `succeed` with a
 result.
 
+The policy that decides this is recorded per call when the model requests it
+(`tool_calls.idempotent`, `tool_calls.max_attempts`, store schema v2; `_Driver._policy` reads it).
+Otherwise editing a tool's declaration between a crash and a resume could turn an interrupted
+non-idempotent call into an automatic retry. A call whose tool has disappeared is checked by its
+persisted state first: never started means a definite failure, interrupted means ambiguous.
+
+Arguments are checked twice before an attempt is marked `started`: against the JSON Schema, and
+with `inspect.signature(fn).bind(**arguments)` (`Tool.binding_errors`). A schema that allows extra
+properties would otherwise let `fn(**arguments)` raise `TypeError`, which would be classified as
+ambiguous although the tool never ran.
+
 ## 4. Fencing tokens instead of locks or leases
 
 `Store.claim` writes a fresh `owner_token`; `Store.tx(run_id, token)` checks it inside the same
@@ -62,8 +73,17 @@ same run can both begin an in-flight tool before one is fenced out; documented a
 
 `Runtime.create` stores `deadline_at = now + max_wall_s`. `_Driver._stop_reason` checks it before
 each model call and each tool attempt, and `_Driver._execute` caps each tool timeout at the
-remaining time (`test_deadline_caps_the_tool_timeout`). A run resumed after its deadline fails
-immediately.
+remaining time (`test_deadline_caps_the_tool_timeout`) for idempotent tools. A non-idempotent
+call is not started at all when less time is left than its timeout: a deadline-capped timeout
+would make it ambiguous while its side effect could still happen, so the run fails with
+`budget_exhausted` and the call stays `requested`
+(`test_non_idempotent_call_is_not_started_without_time_for_its_timeout`).
+
+A run resumed after its deadline fails immediately, including a `blocked` one: the deadline keeps
+running while a run waits for an operator, and `blocked -> failed` is an allowed transition for
+exactly this case. An operator decision recorded on an expired run is kept, but the run does not
+continue. The alternative, pausing the deadline while blocked, was rejected because it would let
+a run outlive its budget by an unbounded operator delay.
 
 Rejected: a per-process timer. It would reset on every resume, so a run that crashes repeatedly
 would never run out of time.
@@ -109,8 +129,12 @@ database. The cost is that the database names code to import; the data directory
 ## 10. The trace is written after the commit and is not authoritative
 
 `TraceWriter.write` appends one JSON line per event, after the database commit it describes, with
-the agent's redactor applied first (`redact_sensitive_keys` masks values of credential-looking
-keys at any depth; the triage example chains `mask_phone_numbers`). A crash can lose the trace
+the agent's redactor applied first. `redact_sensitive_keys` matches key names by whole segments
+(`is_sensitive_key`), so `session_token` is masked and `prompt_tokens` is not, and masks
+credential-shaped substrings inside every string value (`redact_string`: `sk-` keys, GitHub, AWS
+and Slack tokens, JWTs, bearer values, PEM keys, `password=` style assignments). This is a
+best-effort filter, not a guarantee; the README lists what it does not catch. The triage example
+chains `mask_phone_numbers`. A crash can lose the trace
 line for the last step but never the step. `read_trace` skips a torn final line.
 
 ## 11. Crash tests kill a real process
@@ -131,4 +155,5 @@ code; a kill from outside is closer to an OOM kill or a node going away.
 The plan listed `pending -> running -> waiting_tool -> completed | failed | cancelled`. A
 non-idempotent ambiguous call needs a state that is neither terminal nor runnable, so `blocked`
 was added, reachable only from `waiting_tool` and left only by an operator decision
-(`blocked -> waiting_tool`) or a cancel.
+(`blocked -> waiting_tool`), a cancel, or the deadline passing (`blocked -> failed`, see
+section 5).

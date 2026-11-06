@@ -71,6 +71,12 @@ no side effect (retry even for non-idempotent tools), and every timeout or other
 ambiguous (retry only if `Tool.idempotent`). Timeouts are ambiguous for a concrete reason:
 `invoke_with_timeout` cannot kill the worker thread, so a timed-out attempt can still finish.
 
+Two cases that look like tool failures are kept out of the ambiguous bucket because the tool
+provably never ran: arguments the function cannot bind (`Tool.binding_errors`, checked before the
+attempt is marked `started`) and a non-idempotent call with less time left than its timeout (not
+started; the run fails with `budget_exhausted`). Both were found in review and have tests in
+`tests/test_regressions.py`.
+
 Evidence: `test_non_idempotent_tool_is_not_retried_after_ambiguous_failure` (one execution, run
 `blocked`), `test_non_idempotent_transient_error_is_retried` (two executions, completed),
 `test_flaky_idempotent_tool_is_retried_with_backoff` (backoff delays `[0.2, 0.4]` recorded by an
@@ -130,7 +136,8 @@ exit before the database is reopened; without that wait the parent got `disk I/O
 - SQLite over PostgreSQL: one file per data directory and no server, at the cost of a single
   writer. A run has one writer anyway.
 - Sequential tools within a turn: simpler checkpoints and ordering, slower for independent reads.
-- Absolute deadline: survives crashes, but a run resumed late fails immediately.
+- Absolute deadline: survives crashes, but a run resumed late fails immediately, including a
+  `blocked` run whose operator answered after the deadline (`blocked -> failed`).
 - Trace after commit: the trace may miss the last event; the store never does.
 - No agent framework: the loop is small enough to read in one sitting, at the cost of features
   such as streaming and parallel tool calls.
@@ -139,4 +146,6 @@ exit before the database is reopened; without that wait the parent got `disk I/O
 
 - Not exactly-once execution.
 - Not tested against a real model API; the HTTP provider is tested with `httpx.MockTransport`.
+- Not complete secret redaction; it is key-segment and value-shape matching, documented in the
+  README.
 - No numbers on model quality; the demo uses a scripted model.
