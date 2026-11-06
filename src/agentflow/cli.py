@@ -13,6 +13,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from agentflow.agent import Agent, load_agent
 from agentflow.faults import stall_listener
 from agentflow.runtime import Listener, RunOutcome, Runtime
 from agentflow.state import RunStatus
@@ -82,6 +83,16 @@ def _listeners(args: argparse.Namespace) -> list[Listener]:
     return []
 
 
+def _agent_for(runtime: Runtime, run_id: str) -> Agent | None:
+    """The run's agent, so operator events use its redactor; None if it cannot be built here."""
+    try:
+        return load_agent(runtime.store.get_run(run_id).agent_ref, runtime.data_dir)
+    except RunNotFound:
+        raise
+    except Exception:
+        return None  # operator events carry no payloads; the default redactor is enough
+
+
 def _report(outcome: RunOutcome) -> int:
     print(f"run {outcome.run_id}: {outcome.status}")
     if outcome.error:
@@ -127,7 +138,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_demo(args.workdir)
 
     listeners = _listeners(args) if args.command in {"start", "resume"} else []
-    runtime = Runtime(args.data_dir, listeners=listeners)
+    try:
+        runtime = Runtime(args.data_dir, listeners=listeners)
+    except Exception as exc:
+        if os.environ.get("AGENTFLOW_DEBUG"):
+            raise
+        print(f"error: cannot open {args.data_dir}: {exc}", file=sys.stderr)
+        return 2
     try:
         if args.command == "start":
             run_id = runtime.create(args.agent, args.goal)
@@ -152,7 +169,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(format_trace(read_trace(path)))
             return 0
         if args.command == "cancel":
-            status = runtime.cancel(args.run_id)
+            status = runtime.cancel(args.run_id, agent=_agent_for(runtime, args.run_id))
             if status is RunStatus.CANCELLED:
                 print(f"run {args.run_id}: cancelled")
             elif status in (RunStatus.COMPLETED, RunStatus.FAILED):
@@ -164,19 +181,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             return 0
         if args.command == "resolve":
+            agent = _agent_for(runtime, args.run_id)
             if args.retry:
-                runtime.resolve(args.run_id, args.call_id, "retry")
+                runtime.resolve(args.run_id, args.call_id, "retry", agent=agent)
             elif args.fail is not None:
-                runtime.resolve(args.run_id, args.call_id, "fail", args.fail)
+                runtime.resolve(args.run_id, args.call_id, "fail", args.fail, agent=agent)
             else:
-                runtime.resolve(args.run_id, args.call_id, "succeed", json.loads(args.result))
+                runtime.resolve(
+                    args.run_id, args.call_id, "succeed", json.loads(args.result), agent=agent
+                )
             print(f"resolved {args.call_id}; continue with: agentflow resume {args.run_id}")
             return 0
     except RunNotFound as exc:
         print(f"no such run: {exc.args[0]}", file=sys.stderr)
         return 2
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    except Exception as exc:
+        # Report, do not dump a traceback; AGENTFLOW_DEBUG=1 re-raises for debugging.
+        if os.environ.get("AGENTFLOW_DEBUG"):
+            raise
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
     finally:
         runtime.close()

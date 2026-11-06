@@ -21,6 +21,7 @@ may or may not have happened.
 
 from __future__ import annotations
 
+import inspect
 import json
 import threading
 from collections.abc import Callable, Iterator
@@ -75,6 +76,7 @@ class Tool:
     timeout_s: float = 10.0
     retry: RetryPolicy = field(default_factory=RetryPolicy)
     validator: Draft202012Validator = field(init=False, repr=False, compare=False)
+    signature: inspect.Signature | None = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.parameters.get("type") != "object":
@@ -82,6 +84,26 @@ class Tool:
         if self.timeout_s <= 0:
             raise ValueError(f"tool {self.name!r}: timeout_s must be positive")
         object.__setattr__(self, "validator", make_validator(self.parameters))
+        try:
+            signature: inspect.Signature | None = inspect.signature(self.fn)
+        except (TypeError, ValueError):  # some builtins and C callables have no signature
+            signature = None
+        object.__setattr__(self, "signature", signature)
+
+    def binding_errors(self, arguments: Any) -> list[str]:
+        """Check that ``fn(**arguments)`` can be called, without calling it.
+
+        The JSON Schema may allow properties the function does not accept (for example when
+        ``additionalProperties`` is not false). Such a call would raise ``TypeError`` before the
+        tool did anything, so it is rejected up front as a definite error, never as ambiguous.
+        """
+        if self.signature is None or not isinstance(arguments, dict):
+            return []
+        try:
+            self.signature.bind(**arguments)
+        except TypeError as exc:
+            return [f"arguments do not match {self.name}(): {exc}"]
+        return []
 
     def spec(self) -> dict[str, Any]:
         """Description handed to the model provider."""
@@ -114,7 +136,7 @@ class ToolRegistry:
         if tool is None:
             known = ", ".join(sorted(self._tools)) or "none"
             return [f"unknown tool {name!r}; available tools: {known}"]
-        return validation_errors(tool.validator, arguments)
+        return validation_errors(tool.validator, arguments) or tool.binding_errors(arguments)
 
 
 def invoke_with_timeout(tool: Tool, arguments: dict[str, Any], timeout_s: float) -> Any:

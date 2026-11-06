@@ -7,6 +7,7 @@ last committed step, never a step itself.
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import time
@@ -16,23 +17,77 @@ from typing import Any, cast
 
 Redactor = Callable[[dict[str, Any]], dict[str, Any]]
 
-SENSITIVE_KEY = re.compile(r"(api[_-]?key|token|secret|password|passwd|authorization|cookie)", re.I)
 REDACTED = "[REDACTED]"
+
+# Key names are split into segments ("x-api-key" -> x, api, key; "sessionToken" -> session,
+# token) and matched whole, so "prompt_tokens", "max_tokens" or "secretary" are left alone.
+SENSITIVE_SEGMENTS = frozenset(
+    {
+        "password",
+        "passwd",
+        "passphrase",
+        "secret",
+        "token",
+        "authorization",
+        "cookie",
+        "credential",
+        "credentials",
+        "apikey",
+    }
+)
+SENSITIVE_PAIRS = frozenset({"apikey", "accesskey", "privatekey", "secretkey", "signingkey"})
+_SEGMENT = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
+
+# Common credential shapes, redacted wherever they appear inside string values (goals, error
+# messages, tool results, malformed argument strings). Not exhaustive; see README.
+SECRET_VALUE = re.compile(
+    r"\bsk-[A-Za-z0-9_-]{8,}"  # OpenAI-style API keys
+    r"|\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}"  # GitHub
+    r"|\bAKIA[0-9A-Z]{16}\b"  # AWS access key id
+    r"|\bxox[abprs]-[A-Za-z0-9-]{10,}"  # Slack
+    r"|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"  # JWT
+    r"|(?i:\bbearer)\s+[A-Za-z0-9._~+/=-]{6,}"  # Authorization header values
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
+)
+# `password=...`, `"api_key": "..."` inside a string (for example unparsed JSON arguments).
+SECRET_ASSIGNMENT = re.compile(
+    r"(?i)((?<![A-Za-z0-9])(?:password|passwd|secret|token|api[_-]?key|access[_-]?key"
+    r"|authorization)[\"']?\s*[:=]\s*)"
+    r"(?:\"[^\"]*\"?|'[^']*'?|[^\"'\s,}&]+)"
+)
+
+
+def is_sensitive_key(key: str) -> bool:
+    segments = [p.lower() for p in _SEGMENT.split(key) if p]
+    if any(seg in SENSITIVE_SEGMENTS for seg in segments):
+        return True
+    return any(a + b in SENSITIVE_PAIRS for a, b in itertools.pairwise(segments))
+
+
+def redact_string(text: str) -> str:
+    text = SECRET_VALUE.sub(REDACTED, text)
+    return SECRET_ASSIGNMENT.sub(lambda m: f"{m.group(1)}{REDACTED}", text)
 
 
 def _redact_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            k: REDACTED if SENSITIVE_KEY.search(str(k)) else _redact_value(v)
-            for k, v in value.items()
+            k: REDACTED if is_sensitive_key(str(k)) else _redact_value(v) for k, v in value.items()
         }
     if isinstance(value, list):
         return [_redact_value(v) for v in value]
+    if isinstance(value, str):
+        return redact_string(value)
     return value
 
 
 def redact_sensitive_keys(event: dict[str, Any]) -> dict[str, Any]:
-    """Default redactor: replace the value of any key that looks like a credential."""
+    """Default redactor.
+
+    Replaces the value of any key whose name contains a credential word as a whole segment, and
+    any substring of a string value that has a common credential shape (see ``SECRET_VALUE`` and
+    ``SECRET_ASSIGNMENT``). Applied recursively to dicts and lists.
+    """
     return cast(dict[str, Any], _redact_value(event))
 
 

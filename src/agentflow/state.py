@@ -43,7 +43,8 @@ TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     RunStatus.WAITING_TOOL: frozenset(
         {RunStatus.RUNNING, RunStatus.BLOCKED, RunStatus.FAILED, RunStatus.CANCELLED}
     ),
-    RunStatus.BLOCKED: frozenset({RunStatus.WAITING_TOOL, RunStatus.CANCELLED}),
+    # blocked -> failed: the wall-clock deadline keeps running while a run waits for an operator.
+    RunStatus.BLOCKED: frozenset({RunStatus.WAITING_TOOL, RunStatus.FAILED, RunStatus.CANCELLED}),
     RunStatus.COMPLETED: frozenset(),
     RunStatus.FAILED: frozenset(),
     RunStatus.CANCELLED: frozenset(),
