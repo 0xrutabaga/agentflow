@@ -44,7 +44,8 @@ between a demo and something that can be left running.
   OpenAI-compatible HTTP provider (`src/agentflow/providers/openai_compat.py`), configured by
   environment variables and tested only against `httpx.MockTransport`.
 - **Trace**: one JSONL file per run with timings, arguments and results, passed through a
-  redaction hook before it is written; `agentflow trace <run_id>` prints a timeline.
+  redaction hook before it is written; `agentflow trace <run_id>` prints a timeline. See
+  [What the trace redacts](#what-the-trace-redacts).
 
 ### Retry and idempotency rules
 
@@ -55,12 +56,25 @@ between a demo and something that can be left running.
 | raised `TransientToolError` (tool says: no side effect) | retried | retried |
 | timed out, or raised any other exception | retried | run moves to `blocked` |
 | process died after the attempt started, before its result was committed | retried on resume | run moves to `blocked` on resume |
+| arguments fail the schema, or the function cannot accept them (`inspect.signature` bind) | rejected before starting, shown to the model | rejected before starting, shown to the model |
+| less time left before the deadline than the tool's timeout | started with the timeout cut to the time left | not started; the run fails with `budget_exhausted` |
 
 Retries are bounded by the tool's `RetryPolicy.max_attempts`, including attempts interrupted by
 a crash. When they run out, the failure is recorded and shown to the model. A `blocked` run waits
 for `agentflow resolve <run_id> <call_id>` with `--retry` (run it again, accepting a possible
 duplicate), `--fail MESSAGE` or `--result JSON` (for example after checking the external system
 by hand), then `agentflow resume <run_id>`.
+
+A call's idempotency flag and `max_attempts` are recorded when the model requests it
+(`tool_calls.idempotent`, `tool_calls.max_attempts`) and those recorded values decide what happens
+on resume, not the tool's current declaration. If the tool is no longer registered on resume, a
+call that never started fails (definite), while a call that was interrupted mid-attempt is treated
+as ambiguous using its recorded policy. If a run is cancelled or hits its deadline while an attempt
+from a dead process is still `started`, that call is marked `ambiguous` (outcome unknown).
+
+The wall-clock deadline keeps running while a run is `blocked`. Resolving a call on an expired
+run is still recorded, but the next `resume` moves the run to `failed`
+(`budget_exhausted: wall-clock deadline passed`) instead of continuing.
 
 What is *not* guaranteed: exactly-once side effects. A crash after a tool's side effect but before
 its result is committed cannot be distinguished from a crash before the side effect. agentflow
@@ -83,6 +97,7 @@ stateDiagram-v2
     waiting_tool --> failed
     waiting_tool --> cancelled
     blocked --> waiting_tool
+    blocked --> failed
     blocked --> cancelled
     completed --> [*]
     failed --> [*]
@@ -98,7 +113,8 @@ table the store enforces; `tests/test_state.py` fails if the two differ.
 - `waiting_tool`: requested tool calls are executed in order. Each call has its own status:
   `requested -> started -> succeeded | failed`, or `rejected` (invalid arguments, never run), or
   `ambiguous` (non-idempotent, outcome unknown).
-- `blocked`: at least one call is `ambiguous`; only an operator decision or a cancel moves it on.
+- `blocked`: at least one call is `ambiguous`; only an operator decision, a cancel, or the
+  deadline passing (checked on the next `resume`) moves it on.
 
 | Module | Responsibility |
 | --- | --- |
@@ -124,7 +140,7 @@ Design decisions and their alternatives are in
   transactions, no server. Durability here is per-run step checkpoints, not a shared job queue.
 - **jsonschema** (Draft 2020-12) for tool arguments and model output.
 - **httpx** only for the optional HTTP provider, because it ships `MockTransport` for tests.
-- No agent framework. The run loop is one file, `src/agentflow/runtime.py` (`wc -l` reports 597
+- No agent framework. The run loop is one file, `src/agentflow/runtime.py` (`wc -l` reports 659
   lines), and every behaviour above is in it.
 
 ## Installation
@@ -276,7 +292,7 @@ uv run mypy src
 uv run pytest -q
 ```
 
-`uv run pytest -q` currently collects 80 tests. The ones that carry the main claims:
+`uv run pytest -q` currently collects 112 tests. The ones that carry the main claims:
 
 | Claim | Test |
 | --- | --- |
@@ -291,6 +307,7 @@ uv run pytest -q
 | timeouts | `test_idempotent_timeout_is_retried_then_reported`, `test_non_idempotent_timeout_blocks` |
 | cancellation | `test_cancel_pending_run_is_immediate`, `test_cancel_requested_during_a_tool_stops_before_the_next_model_call`, `test_cancel_from_another_thread_interrupts_retry_loop` |
 | fencing | `test_stale_runner_is_fenced_out` |
+| expired blocked run fails cleanly; non-idempotent call not started near the deadline; unbindable arguments rejected; recorded policy wins on resume; redaction by key segment and value shape | `tests/test_regressions.py` |
 | HTTP provider (mocked transport) | `tests/test_providers.py` |
 | trace redaction | `tests/test_trace.py` |
 | demo end to end | `tests/test_cli.py::test_demo_end_to_end` |
@@ -300,6 +317,26 @@ point (a marker file written right after a database commit, or from inside a too
 with `Popen.kill` / `os.kill` (SIGKILL on Linux, TerminateProcess on Windows). CI runs the suite
 on `ubuntu-latest` and `windows-latest`.
 
+### What the trace redacts
+
+The default redactor, `agentflow.trace.redact_sensitive_keys`, is applied to every trace event
+before it is written (operator `cancel`/`resolve` events use the agent's redactor when the CLI can
+build the agent, and carry only ids, tool names and statuses):
+
+- **Keys**: the value of any dict key whose name contains `password`, `passwd`, `passphrase`,
+  `secret`, `token`, `authorization`, `cookie`, `credential(s)` or `apikey` as a whole segment, or
+  the adjacent segments `api key`, `access key`, `private key`, `secret key`, `signing key`.
+  Names are split on non-alphanumerics and camelCase, so `x-api-key`, `apiKey` and
+  `session_token` are redacted and `prompt_tokens`, `max_tokens` and `secretary` are not.
+- **Values**: inside any string (goal, error messages, results, unparsed argument strings),
+  substrings shaped like `sk-...` keys, GitHub tokens (`ghp_...`, `github_pat_...`), AWS access key
+  ids (`AKIA...`), Slack tokens (`xox?-...`), JWTs, `Bearer <value>`, PEM private key blocks, and
+  `password=...` / `"api_key": "..."` style assignments.
+- **Not redacted**: secrets with any other shape under a non-sensitive key (for example a random
+  string in a free-text field), personal data such as names or emails, and the SQLite store,
+  which keeps the full conversation unredacted because resume needs it. Agents add their own
+  rules with `chain_redactors`; the triage example adds `mask_phone_numbers`.
+
 ## Limitations
 
 - **No exactly-once tool execution.** See the guarantees above; a non-idempotent tool needs a
@@ -308,12 +345,20 @@ on `ubuntu-latest` and `windows-latest`.
   on the same run at the same time can both execute an in-flight tool before one is fenced out.
   There is no lease or heartbeat; `resume` assumes the previous process is gone.
 - **Timeouts cannot kill a tool.** A timed-out attempt keeps running in a daemon thread (Python
-  cannot stop a thread). This is why timeouts count as ambiguous.
+  cannot stop a thread). This is why timeouts count as ambiguous. For an idempotent tool it also
+  means a retry can start while the timed-out attempt is still running, so up to `max_attempts`
+  copies of one call can run at the same time.
+- **`claim` does not check liveness.** `resume` takes the run over unconditionally; if the old
+  process is in fact alive, fencing stops its next commit but not the tool it is running.
 - **Cancellation is cooperative** at step boundaries (before each model call and each tool
   attempt). An in-flight tool or model call is not interrupted.
 - **The deadline does not interrupt a model call**; the HTTP provider's own timeout bounds it.
 - **Tools in one turn run sequentially.**
 - **Cancelling a run whose runner died** only sets a flag; it takes effect on the next `resume`.
+- **Model-call cost is not bounded by `max_steps` alone.** `max_steps` counts committed model
+  turns. Each turn may be attempted `1 + model_retries` times on transient provider errors, and
+  a turn lost in a crash is requested again on resume, so a run that keeps crashing before its
+  turn commits makes more model calls than `max_steps`.
 - **The scripted model is a script.** The demo shows the runtime's behaviour, not model quality.
 - **`agent_ref` is imported on resume.** Anyone who can write the database can choose which
   importable factory runs; treat the data directory as trusted.
